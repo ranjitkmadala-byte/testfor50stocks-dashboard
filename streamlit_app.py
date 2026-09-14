@@ -202,6 +202,20 @@ def ensure_early_detector_snapshots_table():
         hourly_avwap_low NUMERIC,
         avwap_source_ts TIMESTAMPTZ,
 
+        price_persistence_points NUMERIC NOT NULL DEFAULT 0,
+        oi_confirmation_points NUMERIC NOT NULL DEFAULT 0,
+        futures_state TEXT,
+        futures_state_persistence INTEGER NOT NULL DEFAULT 0,
+        futures_state_points NUMERIC NOT NULL DEFAULT 0,
+        total_flow_3m_cr NUMERIC,
+        money_flow_acceleration_3m_cr NUMERIC,
+        money_flow_acceleration_x NUMERIC,
+        money_flow_points NUMERIC NOT NULL DEFAULT 0,
+        pcr_trend_9m NUMERIC,
+        pcr_trend_points NUMERIC NOT NULL DEFAULT 0,
+        aggression_points NUMERIC NOT NULL DEFAULT 0,
+        imbalance_points NUMERIC NOT NULL DEFAULT 0,
+
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE (trading_date, ts, symbol)
@@ -238,6 +252,19 @@ def ensure_early_detector_snapshots_table():
     ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS hourly_avwap_high NUMERIC;
     ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS hourly_avwap_low NUMERIC;
     ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS avwap_source_ts TIMESTAMPTZ;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS price_persistence_points NUMERIC NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS oi_confirmation_points NUMERIC NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS futures_state TEXT;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS futures_state_persistence INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS futures_state_points NUMERIC NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS total_flow_3m_cr NUMERIC;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS money_flow_acceleration_3m_cr NUMERIC;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS money_flow_acceleration_x NUMERIC;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS money_flow_points NUMERIC NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS pcr_trend_9m NUMERIC;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS pcr_trend_points NUMERIC NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS aggression_points NUMERIC NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS imbalance_points NUMERIC NOT NULL DEFAULT 0;
     """
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -267,7 +294,12 @@ def persist_early_detector_snapshots(history_df):
         "option_source_ts", "aggression_source_ts",
         "avwap_bull_points", "avwap_bear_points", "avwap_state",
         "avwap_high", "avwap_low", "hourly_avwap_high", "hourly_avwap_low",
-        "avwap_source_ts"
+        "avwap_source_ts",
+        "price_persistence_points", "oi_confirmation_points",
+        "futures_state", "futures_state_persistence", "futures_state_points",
+        "total_flow_3m_cr", "money_flow_acceleration_3m_cr", "money_flow_acceleration_x",
+        "money_flow_points", "pcr_trend_9m", "pcr_trend_points",
+        "aggression_points", "imbalance_points"
     ]
 
     def db_value(value):
@@ -1134,13 +1166,20 @@ def load_v2_aggression():
                s.future_oi_change_pct_t0,
                (s.future_oi/NULLIF(u.future_oi,0)-1)*100
            ) AS cumulative_oi_pct,
+           COALESCE(s.future_price_change_3m_pct,a.price_change_3m_pct) AS engine_price_change_3m_pct,
+           COALESCE(s.future_oi_change_3m_pct,a.oi_change_3m_pct) AS engine_oi_change_3m_pct,
+           s.futures_flow_3m_cr,s.options_flow_3m_cr,s.total_flow_3m_cr,
+           s.money_flow_acceleration_3m_cr,s.pcr,s.pcr_change_3m,
            a.volume_traded,u.future_volume AS volume_930,
            a.aggressive_buy_qty,a.aggressive_sell_qty,a.classified_trade_count
     FROM public.futures_aggression_snapshots a
     JOIN public.money_flow_universe u
       ON u.trading_date=a.trading_date AND u.symbol=a.symbol
     LEFT JOIN LATERAL (
-        SELECT e.future,e.future_oi,e.future_oi_change_pct_t0
+        SELECT e.future,e.future_oi,e.future_oi_change_pct_t0,
+              e.future_price_change_3m_pct,e.future_oi_change_3m_pct,
+              e.futures_flow_3m_cr,e.options_flow_3m_cr,e.total_flow_3m_cr,
+              e.money_flow_acceleration_3m_cr,e.pcr,e.pcr_change_3m
         FROM public.stock_engine_snapshots e
         WHERE e.symbol=a.symbol
           AND (e.ts AT TIME ZONE 'Asia/Kolkata')::date=a.trading_date
@@ -1151,7 +1190,12 @@ def load_v2_aggression():
     ORDER BY symbol,ts""")
     if out.empty:
         return out
-    for col in ["session_price_pct","cumulative_oi_pct","volume_traded","volume_930"]:
+    for col in [
+        "session_price_pct","cumulative_oi_pct","volume_traded","volume_930",
+        "engine_price_change_3m_pct","engine_oi_change_3m_pct",
+        "futures_flow_3m_cr","options_flow_3m_cr","total_flow_3m_cr",
+        "money_flow_acceleration_3m_cr","pcr","pcr_change_3m"
+    ]:
         out[col]=pd.to_numeric(out[col],errors="coerce").astype(float)
     out["volume_since_930"]=(pd.to_numeric(out["volume_traded"],errors="coerce")-
                               pd.to_numeric(out["volume_930"],errors="coerce")).clip(lower=0)
@@ -1415,7 +1459,7 @@ def first_persistent(g,col,threshold=5,n=3):
 
 def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatility_df,
                    avwap_df=None):
-    """v2.1 live board with intraday memory.
+    """v2.9 structure-first live board with intraday memory.
 
     Adds:
       - current_state / current_conviction / current_score
@@ -1537,8 +1581,12 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
             a = ag.iloc[-1]
             aggression_source_ts = a.get("ts")
             imb = pd.to_numeric(a.get("total_qty_imbalance"), errors="coerce")
-            px = pd.to_numeric(a.get("price_change_3m_pct"), errors="coerce")
-            oi = pd.to_numeric(a.get("oi_change_3m_pct"), errors="coerce")
+            px = pd.to_numeric(a.get("engine_price_change_3m_pct"), errors="coerce")
+            if pd.isna(px):
+                px = pd.to_numeric(a.get("price_change_3m_pct"), errors="coerce")
+            oi = pd.to_numeric(a.get("engine_oi_change_3m_pct"), errors="coerce")
+            if pd.isna(oi):
+                oi = pd.to_numeric(a.get("oi_change_3m_pct"), errors="coerce")
             session_px = pd.to_numeric(a.get("session_price_pct"), errors="coerce")
             cumoi = pd.to_numeric(a.get("cumulative_oi_pct"), errors="coerce")
             rel_strength = pd.to_numeric(a.get("relative_strength_pct"), errors="coerce")
@@ -1582,82 +1630,169 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
                 else:
                     flow_agreement = "PARTIAL / NEUTRAL"
 
-        bull = opt_pts(bo, bp)
-        bear = opt_pts(so, sp)
-        if bull_opt_quality >= 3 and bo > so: bull += 0.5
-        if bear_opt_quality >= 3 and so > bo: bear += 0.5
+        # ============================================================
+        # EARLY DETECTOR v2.9 — STRUCTURE-FIRST /10 SCORE
+        #
+        # BSE + COCHINSHIP research revision:
+        #   Price persistence       2.0
+        #   Futures OI confirmation 2.0
+        #   Futures-state persistence 2.0
+        #   3m money-flow expansion 1.5
+        #   PCR rolling trend       1.0
+        #   Executed aggression     1.0
+        #   Qty imbalance           0.5
+        #
+        # Options, same-strike OI, AVWAP, RS and volume remain visible
+        # confirmations but no longer inflate the primary /10 score.
+        # ============================================================
 
-        # 09:20 same-strike OI confirmation: max 1.5 points per side.
-        # Base confirmation = 0.5, strong opposite-side increase = +0.5,
-        # persistence for >=3 snapshots = +0.5 (computed by the collector).
-        bull += min(1.5, same_strike_bull_points)
-        bear += min(1.5, same_strike_bear_points)
+        bull = 0.0
+        bear = 0.0
 
-        # Displayed order quantity is supporting evidence only (maximum 1 point).
-        if pd.notna(imb):
-            if imb >= 20:
-                bull += 1
-            elif imb <= -20:
-                bear += 1
+        # ---------- 1) PRICE PERSISTENCE: max 2 points ----------
+        price_persistence_points = 0.0
+        bull_price_p = bear_price_p = 0
+        if not ag.empty:
+            recent_px = pd.to_numeric(
+                ag.get("engine_price_change_3m_pct", ag.get("price_change_3m_pct")),
+                errors="coerce"
+            ).dropna().tail(3)
+            bull_count = int((recent_px > 0.05).sum())
+            bear_count = int((recent_px < -0.05).sum())
+            bull_price_p = 2.0 if len(recent_px) >= 3 and bull_count == 3 else 1.0 if bull_count >= 2 else 0.0
+            bear_price_p = 2.0 if len(recent_px) >= 3 and bear_count == 3 else 1.0 if bear_count >= 2 else 0.0
+            bull += bull_price_p
+            bear += bear_price_p
+            price_persistence_points = max(bull_price_p, bear_price_p)
 
-        # Executed delta receives up to 2 points, but only with a useful sample.
+        # ---------- 2) FUTURES OI CONFIRMATION: max 2 points ----------
+        oi_confirmation_points = 0.0
+        bull_oi_pts = bear_oi_pts = 0.0
+        directional_sign = 1 if pd.notna(session_px) and session_px > 0 else -1 if pd.notna(session_px) and session_px < 0 else (1 if pd.notna(px) and px > 0 else -1 if pd.notna(px) and px < 0 else 0)
+        if pd.notna(oi) and oi >= 0.10:
+            if directional_sign > 0:
+                bull_oi_pts += 1.0
+            elif directional_sign < 0:
+                bear_oi_pts += 1.0
+        if pd.notna(cumoi) and cumoi >= 1.0:
+            if directional_sign > 0:
+                bull_oi_pts += 1.0
+            elif directional_sign < 0:
+                bear_oi_pts += 1.0
+        bull += min(2.0, bull_oi_pts)
+        bear += min(2.0, bear_oi_pts)
+        oi_confirmation_points = max(bull_oi_pts, bear_oi_pts)
+
+        # ---------- 3) FUTURES STATE PERSISTENCE: max 2 points ----------
+        futures_state = "UNKNOWN"
+        futures_state_persistence = 0
+        futures_state_points = 0.0
+        if pd.notna(px) and pd.notna(oi):
+            if px > 0 and oi > 0:
+                futures_state = "LONG_BUILDUP"
+            elif px < 0 and oi > 0:
+                futures_state = "SHORT_BUILDUP"
+            elif px > 0 and oi < 0:
+                futures_state = "SHORT_COVERING"
+            elif px < 0 and oi < 0:
+                futures_state = "LONG_UNWINDING"
+            else:
+                futures_state = "MIXED"
+
+        if not ag.empty:
+            px_hist = pd.to_numeric(
+                ag.get("engine_price_change_3m_pct", ag.get("price_change_3m_pct")),
+                errors="coerce"
+            )
+            oi_hist = pd.to_numeric(
+                ag.get("engine_oi_change_3m_pct", ag.get("oi_change_3m_pct")),
+                errors="coerce"
+            )
+            long_flags = ((px_hist > 0) & (oi_hist > 0)).astype(int)
+            short_flags = ((px_hist < 0) & (oi_hist > 0)).astype(int)
+            long_state_p = tail_count(long_flags, lambda x: x == 1)
+            short_state_p = tail_count(short_flags, lambda x: x == 1)
+
+            if long_state_p > short_state_p and long_state_p > 0:
+                futures_state_persistence = long_state_p
+                futures_state_points = 2.0 if long_state_p >= 3 else 1.0 if long_state_p >= 2 else 0.0
+                bull += futures_state_points
+            elif short_state_p > 0:
+                futures_state_persistence = short_state_p
+                futures_state_points = 2.0 if short_state_p >= 3 else 1.0 if short_state_p >= 2 else 0.0
+                bear += futures_state_points
+
+        # ---------- 4) LIVE 3-MIN MONEY FLOW EXPANSION: max 1.5 ----------
+        total_flow_3m_cr = None
+        money_flow_acceleration_3m_cr = None
+        money_flow_acceleration_x = None
+        money_flow_points = 0.0
+        if not ag.empty and "total_flow_3m_cr" in ag.columns:
+            flow_series = pd.to_numeric(ag["total_flow_3m_cr"], errors="coerce")
+            current_flow = flow_series.iloc[-1] if len(flow_series) else float("nan")
+            prior = flow_series.iloc[:-1].dropna().tail(5)
+            total_flow_3m_cr = None if pd.isna(current_flow) else float(current_flow)
+            money_flow_acceleration_3m_cr = pd.to_numeric(
+                ag.iloc[-1].get("money_flow_acceleration_3m_cr"), errors="coerce"
+            )
+            if pd.notna(current_flow) and len(prior) >= 3 and prior.mean() > 0:
+                money_flow_acceleration_x = float(current_flow / prior.mean())
+                money_flow_points = 1.5 if money_flow_acceleration_x >= 2.0 else 1.0 if money_flow_acceleration_x >= 1.5 else 0.0
+                if money_flow_points:
+                    if pd.notna(px) and px > 0:
+                        bull += money_flow_points
+                    elif pd.notna(px) and px < 0:
+                        bear += money_flow_points
+
+        # ---------- 5) PCR PERSISTENCE / 9-MIN TREND: max 1 ----------
+        pcr_trend_9m = None
+        pcr_trend_points = 0.0
+        if not ag.empty and "pcr_change_3m" in ag.columns:
+            pcr_changes = pd.to_numeric(ag["pcr_change_3m"], errors="coerce").dropna().tail(3)
+            if len(pcr_changes) >= 2:
+                pcr_trend_9m = float(pcr_changes.sum())
+                positive = int((pcr_changes > 0).sum())
+                negative = int((pcr_changes < 0).sum())
+                if positive >= 2 and pcr_trend_9m > 0:
+                    bull += 1.0
+                    pcr_trend_points = 1.0
+                elif negative >= 2 and pcr_trend_9m < 0:
+                    bear += 1.0
+                    pcr_trend_points = 1.0
+
+        # ---------- 6) EXECUTED AGGRESSION: max 1 ----------
+        aggression_points = 0.0
         if delta_eligible:
             if td >= 30:
-                bull += 2 if delta_buy_p >= 2 else 1
+                bull += 1.0
+                aggression_points = 1.0
             elif td <= -30:
-                bear += 2 if delta_sell_p >= 2 else 1
+                bear += 1.0
+                aggression_points = 1.0
 
-        if pd.notna(px):
-            if px > 0.05:
-                bull += 1
-            elif px < -0.05:
-                bear += 1
+        # ---------- 7) QUANTITY IMBALANCE: max 0.5 ----------
+        imbalance_points = 0.0
+        if pd.notna(imb):
+            if imb >= 20:
+                bull += 0.5
+                imbalance_points = 0.5
+            elif imb <= -20:
+                bear += 0.5
+                imbalance_points = 0.5
 
-        if pd.notna(oi) and oi >= 0.10 and pd.notna(px):
-            if px > 0:
-                bull += 1
-            elif px < 0:
-                bear += 1
+        # Keep existing option/same-strike fields as confirmation diagnostics.
+        # They are intentionally NOT added to the primary v2.9 score.
+        bull_option_confirmation = opt_pts(bo, bp)
+        bear_option_confirmation = opt_pts(so, sp)
+        if bull_opt_quality >= 3 and bo > so:
+            bull_option_confirmation += 0.5
+        if bear_opt_quality >= 3 and so > bo:
+            bear_option_confirmation += 0.5
+        bull_option_confirmation += min(1.5, same_strike_bull_points)
+        bear_option_confirmation += min(1.5, same_strike_bear_points)
 
-        # Cumulative session movement from the frozen daily baseline.
-        realized_3m_vol = volmap.get(sym)
-        local_ts=pd.Timestamp(ts)
-        local_ts=(local_ts.tz_localize("UTC") if local_ts.tzinfo is None else local_ts).tz_convert(IST)
-        elapsed_bars=max(1,(local_ts.hour*60+local_ts.minute-(9*60+30))/3)
-        expected_move = (realized_3m_vol * math.sqrt(elapsed_bars)
-                         if pd.notna(realized_3m_vol) and realized_3m_vol>0 else None)
-        normalized_units = (abs(session_px)/expected_move
-                            if pd.notna(session_px) and expected_move else None)
-        smp = session_pts(session_px, normalized_units)
-        if pd.notna(session_px):
-            if session_px > 0:
-                bull += smp
-            elif session_px < 0:
-                bear += smp
-
-        # Strong option breadth aligned with a >=0.50% stock move.
-        if pd.notna(session_px) and session_px >= 0.50 and bo >= 5:
-            bull += 1
-        elif pd.notna(session_px) and session_px <= -0.50 and so >= 5:
-            bear += 1
-
-        # +/-1% cumulative futures OI is neutral. Positive buildup beyond 1%
-        # confirms the direction of the cumulative price move.
-        if pd.notna(cumoi) and cumoi >= 1 and pd.notna(session_px):
-            if session_px > 0:
-                bull += 1
-            elif session_px < 0:
-                bear += 1
-
-        # Stock-specific participation quality: relative performance versus
-        # today's frozen-universe median and high futures-volume participation.
-        if pd.notna(rel_strength):
-            if rel_strength >= 0.25 and bull > bear: bull += 0.5
-            elif rel_strength <= -0.25 and bear > bull: bear += 0.5
-        if pd.notna(vol_pctile) and vol_pctile >= 0.75:
-            if bull > bear: bull += 0.5
-            elif bear > bull: bear += 0.5
-
+        # Stock-specific participation and AVWAP remain diagnostic confirmations.
+        # They no longer add points to the core /10 score.
         # First-hour AVWAP confirmation contributes at most 1.5 points per side:
         # 0.5 for each continuing AVWAP above/below its frozen 09:15-10:15
         # reference, plus 0.5 for a fresh aligned crossing within 30 minutes.
@@ -1690,8 +1825,7 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
                 if avwap_bull_points > avwap_bear_points: avwap_state = "BULLISH CONFIRMATION"
                 elif avwap_bear_points > avwap_bull_points: avwap_state = "BEARISH CONFIRMATION"
                 else: avwap_state = "MIXED / NEUTRAL"
-                bull += avwap_bull_points
-                bear += avwap_bear_points
+                # v2.9: AVWAP is confirmation-only; do not add to primary /10 score.
 
         extension_status = "UNKNOWN"
         if pd.notna(normalized_units):
@@ -1708,10 +1842,7 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
             except Exception:
                 accel_active = False
             if accel_active:
-                if bull > bear:
-                    bull += 1
-                elif bear > bull:
-                    bear += 1
+                pass  # v2.9: milestone acceleration is diagnostic, not an extra score point.
 
         state, conviction, score, direction, absorption = classify_state(
             bull, bear, imb, px, td, delta_eligible, m24, bo, so, session_px
@@ -1754,7 +1885,20 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
             "avwap_low": avwap_low,
             "hourly_avwap_high": hourly_avwap_high,
             "hourly_avwap_low": hourly_avwap_low,
-            "avwap_source_ts": avwap_source_ts
+            "avwap_source_ts": avwap_source_ts,
+            "price_persistence_points": price_persistence_points,
+            "oi_confirmation_points": oi_confirmation_points,
+            "futures_state": futures_state,
+            "futures_state_persistence": futures_state_persistence,
+            "futures_state_points": futures_state_points,
+            "total_flow_3m_cr": total_flow_3m_cr,
+            "money_flow_acceleration_3m_cr": money_flow_acceleration_3m_cr,
+            "money_flow_acceleration_x": money_flow_acceleration_x,
+            "money_flow_points": money_flow_points,
+            "pcr_trend_9m": pcr_trend_9m,
+            "pcr_trend_points": pcr_trend_points,
+            "aggression_points": aggression_points,
+            "imbalance_points": imbalance_points
         }
 
     result = []
@@ -1838,7 +1982,13 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
                 "aggression_quality":"NO DATA","order_flow_agreement":"NO DATA"
                 ,"avwap_bull_points":0.0,"avwap_bear_points":0.0,
                 "avwap_state":"NO DATA","avwap_high":None,"avwap_low":None,
-                "hourly_avwap_high":None,"hourly_avwap_low":None,"avwap_source_ts":pd.NaT
+                "hourly_avwap_high":None,"hourly_avwap_low":None,"avwap_source_ts":pd.NaT,
+                "price_persistence_points":0.0,"oi_confirmation_points":0.0,
+                "futures_state":"UNKNOWN","futures_state_persistence":0,"futures_state_points":0.0,
+                "total_flow_3m_cr":None,"money_flow_acceleration_3m_cr":None,
+                "money_flow_acceleration_x":None,"money_flow_points":0.0,
+                "pcr_trend_9m":None,"pcr_trend_points":0.0,
+                "aggression_points":0.0,"imbalance_points":0.0
             }
             peak_state, peak_conviction, peak_score, peak_time = "NEUTRAL","LOW",0.0,pd.NaT
             reversal, reversal_time = False, pd.NaT
@@ -1959,6 +2109,19 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
             "hourly_avwap_high": current.get("hourly_avwap_high"),
             "hourly_avwap_low": current.get("hourly_avwap_low"),
             "avwap_source_ts": current.get("avwap_source_ts"),
+            "price_persistence_points": current.get("price_persistence_points",0),
+            "oi_confirmation_points": current.get("oi_confirmation_points",0),
+            "futures_state": current.get("futures_state","UNKNOWN"),
+            "futures_state_persistence": current.get("futures_state_persistence",0),
+            "futures_state_points": current.get("futures_state_points",0),
+            "total_flow_3m_cr": current.get("total_flow_3m_cr"),
+            "money_flow_acceleration_3m_cr": current.get("money_flow_acceleration_3m_cr"),
+            "money_flow_acceleration_x": current.get("money_flow_acceleration_x"),
+            "money_flow_points": current.get("money_flow_points",0),
+            "pcr_trend_9m": current.get("pcr_trend_9m"),
+            "pcr_trend_points": current.get("pcr_trend_points",0),
+            "aggression_points": current.get("aggression_points",0),
+            "imbalance_points": current.get("imbalance_points",0),
 
             "minutes_2_to_4": pd.to_numeric(m.get("minutes_2_to_4"), errors="coerce") if m is not None else None,
             "time_2pct": m.get("time_2pct") if m is not None else pd.NaT,
@@ -2096,7 +2259,7 @@ def build_fast_reversal_events(history_df):
 # UI
 # ============================================================
 
-st.title(f"Top {MONEY_FLOW_TOP_N} Money Flow — Early Detector v2.8")
+st.title(f"Top {MONEY_FLOW_TOP_N} Money Flow — Early Detector v2.9")
 st.caption("State + Conviction • Options → Executed Delta → Order Book → Price Response → Futures OI → Acceleration.")
 
 universe = load_universe()
@@ -2193,7 +2356,7 @@ with tab0:
             "Futures aggression is unavailable for the current universe date. "
             "Scores are option-only and should not be compared with fully confirmed scores."
         )
-    st.subheader("Early Detector v2.8 — Current + Peak State")
+    st.subheader("Early Detector v2.9 — Structure-First Current + Peak State")
     st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
 
     if v2_board.empty:
@@ -2233,6 +2396,10 @@ with tab0:
             "avwap_state","avwap_bull_points","avwap_bear_points",
             "avwap_high","hourly_avwap_high","avwap_low","hourly_avwap_low","avwap_source_ts",
             "session_price_pct","cumulative_oi_pct",
+            "price_persistence_points","oi_confirmation_points",
+            "futures_state","futures_state_persistence","futures_state_points",
+            "total_flow_3m_cr","money_flow_acceleration_3m_cr","money_flow_acceleration_x","money_flow_points",
+            "pcr_trend_9m","pcr_trend_points","aggression_points","imbalance_points",
             "normalized_move_units","extension_status",
             "option_oi_iv_confirmation",
             "same_strike_oi_signal","same_strike_oi_points","same_strike_oi_persistence",
@@ -2282,6 +2449,19 @@ with tab0:
                 "avwap_source_ts":"AVWAP Time",
                 "session_price_pct":st.column_config.NumberColumn(f"Fut vs {FREEZE_LABEL} %",format="%.3f"),
                 "cumulative_oi_pct":st.column_config.NumberColumn(f"Cum OI vs {FREEZE_LABEL} %",format="%.3f"),
+                "price_persistence_points":st.column_config.NumberColumn("Price Persist /2",format="%.1f"),
+                "oi_confirmation_points":st.column_config.NumberColumn("OI Confirm /2",format="%.1f"),
+                "futures_state":"Futures State",
+                "futures_state_persistence":"State Persist",
+                "futures_state_points":st.column_config.NumberColumn("State /2",format="%.1f"),
+                "total_flow_3m_cr":st.column_config.NumberColumn("3m Money Flow ₹Cr",format="%.2f"),
+                "money_flow_acceleration_3m_cr":st.column_config.NumberColumn("Flow Δ3m ₹Cr",format="%.2f"),
+                "money_flow_acceleration_x":st.column_config.NumberColumn("Flow Accel ×",format="%.2f"),
+                "money_flow_points":st.column_config.NumberColumn("Flow /1.5",format="%.1f"),
+                "pcr_trend_9m":st.column_config.NumberColumn("PCR 9m Trend",format="%.4f"),
+                "pcr_trend_points":st.column_config.NumberColumn("PCR /1",format="%.1f"),
+                "aggression_points":st.column_config.NumberColumn("Aggression /1",format="%.1f"),
+                "imbalance_points":st.column_config.NumberColumn("Imbalance /0.5",format="%.1f"),
                 "normalized_move_units":st.column_config.NumberColumn("Vol-normalized move",format="%.2f×"),
                 "extension_status":"Extension",
                 "option_oi_iv_confirmation":st.column_config.NumberColumn("Option OI/IV confirm",format="%.0f"),
@@ -2301,10 +2481,12 @@ with tab0:
             }
         )
 
-        st.markdown("#### v2.7 scoring logic")
+        st.markdown("#### v2.9 structure-first scoring logic")
         st.caption(
-            "Current State = latest structure. Peak State Today = strongest clean directional state seen intraday. "
-            f"Reversal = a meaningful bull↔bear flip after score ≥4. Session price and cumulative OI use the frozen {FREEZE_LABEL} baseline; ±1% cumulative OI is neutral."
+            "Primary /10 score: Price persistence 2 + Futures OI confirmation 2 + "
+            "LONG/SHORT buildup persistence 2 + 3-minute money-flow expansion 1.5 + "
+            "PCR rolling trend 1 + executed aggression 1 + quantity imbalance 0.5. "
+            "Options, same-strike OI, AVWAP, relative strength and volume remain confirmation diagnostics."
         )
         st.caption(
             "First-hour AVWAP adds at most 1.5 aligned points after 10:15 IST: "
