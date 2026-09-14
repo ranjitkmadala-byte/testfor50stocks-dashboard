@@ -1827,6 +1827,30 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
                 else: avwap_state = "MIXED / NEUTRAL"
                 # v2.9: AVWAP is confirmation-only; do not add to primary /10 score.
 
+        # Volatility-normalized session move is still used for display/extension status,
+        # but no longer contributes points to the v2.9 primary /10 score.
+        realized_3m_vol = volmap.get(sym)
+        local_ts = pd.Timestamp(ts)
+        local_ts = (
+            local_ts.tz_localize("UTC")
+            if local_ts.tzinfo is None
+            else local_ts
+        ).tz_convert(IST)
+        elapsed_bars = max(
+            1,
+            (local_ts.hour * 60 + local_ts.minute - (9 * 60 + 30)) / 3
+        )
+        expected_move = (
+            realized_3m_vol * math.sqrt(elapsed_bars)
+            if pd.notna(realized_3m_vol) and realized_3m_vol > 0
+            else None
+        )
+        normalized_units = (
+            abs(session_px) / expected_move
+            if pd.notna(session_px) and expected_move
+            else None
+        )
+
         extension_status = "UNKNOWN"
         if pd.notna(normalized_units):
             extension_status = ("EARLY" if normalized_units < 0.75 else
@@ -2259,7 +2283,7 @@ def build_fast_reversal_events(history_df):
 # UI
 # ============================================================
 
-st.title(f"Top {MONEY_FLOW_TOP_N} Money Flow — Early Detector v2.9")
+st.title(f"Top {MONEY_FLOW_TOP_N} Money Flow — Early Detector v2.9.1")
 st.caption("State + Conviction • Options → Executed Delta → Order Book → Price Response → Futures OI → Acceleration.")
 
 universe = load_universe()
@@ -2356,7 +2380,7 @@ with tab0:
             "Futures aggression is unavailable for the current universe date. "
             "Scores are option-only and should not be compared with fully confirmed scores."
         )
-    st.subheader("Early Detector v2.9 — Structure-First Current + Peak State")
+    st.subheader("Early Detector v2.9.1 — Structure-First Current + Peak State")
     st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
 
     if v2_board.empty:
@@ -2481,7 +2505,7 @@ with tab0:
             }
         )
 
-        st.markdown("#### v2.9 structure-first scoring logic")
+        st.markdown("#### v2.9.1 structure-first scoring logic")
         st.caption(
             "Primary /10 score: Price persistence 2 + Futures OI confirmation 2 + "
             "LONG/SHORT buildup persistence 2 + 3-minute money-flow expansion 1.5 + "
