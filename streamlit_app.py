@@ -1525,9 +1525,11 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
         if absorption and score < 6:
             return absorption, "WARNING", score, direction, absorption
         if score >= 8:
+            # Standardized top label across Stock and Index dashboards.
+            # Acceleration remains an additional qualifier rather than replacing conviction.
             if pd.notna(m24) and m24 <= 30:
-                return ("ACCELERATING LONG" if direction == "BULL" else "ACCELERATING SHORT"), "VERY HIGH", score, direction, absorption
-            return ("CONFIRMED LONG" if direction == "BULL" else "CONFIRMED SHORT"), "VERY HIGH", score, direction, absorption
+                return ("HIGH CONVICTION LONG — ACCELERATING" if direction == "BULL" else "HIGH CONVICTION SHORT — ACCELERATING"), "VERY HIGH", score, direction, absorption
+            return ("HIGH CONVICTION LONG" if direction == "BULL" else "HIGH CONVICTION SHORT"), "VERY HIGH", score, direction, absorption
         if score >= 6:
             return ("CONFIRMED LONG" if direction == "BULL" else "CONFIRMED SHORT"), "HIGH", score, direction, absorption
         if score >= 4:
@@ -2380,7 +2382,7 @@ with tab0:
             "Futures aggression is unavailable for the current universe date. "
             "Scores are option-only and should not be compared with fully confirmed scores."
         )
-    st.subheader("Early Detector v2.9.1 — Structure-First Current + Peak State")
+    st.subheader("Early Detector v2.9.2 — Structure-First Current + Peak State")
     st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
 
     if v2_board.empty:
@@ -2505,7 +2507,7 @@ with tab0:
             }
         )
 
-        st.markdown("#### v2.9.1 structure-first scoring logic")
+        st.markdown("#### v2.9.2 structure-first scoring logic")
         st.caption(
             "Primary /10 score: Price persistence 2 + Futures OI confirmation 2 + "
             "LONG/SHORT buildup persistence 2 + 3-minute money-flow expansion 1.5 + "
