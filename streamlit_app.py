@@ -2295,9 +2295,16 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
         })
 
     result_df = pd.DataFrame(result)
+    # Keep only non-empty history frames before concatenation.
+    # This avoids pandas' empty/all-NA concat FutureWarning while preserving
+    # the full schema required by the Neon snapshot writer.
+    valid_history = [
+        df for df in snapshot_history
+        if df is not None and not df.empty
+    ]
     result_df.attrs["snapshot_history"] = (
-        pd.concat(snapshot_history, ignore_index=True)
-        if snapshot_history else pd.DataFrame()
+        pd.concat(valid_history, ignore_index=True)
+        if valid_history else pd.DataFrame()
     )
     return result_df
 
