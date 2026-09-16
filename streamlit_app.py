@@ -215,6 +215,15 @@ def ensure_early_detector_snapshots_table():
         pcr_trend_points NUMERIC NOT NULL DEFAULT 0,
         aggression_points NUMERIC NOT NULL DEFAULT 0,
         imbalance_points NUMERIC NOT NULL DEFAULT 0,
+        regime_state TEXT,
+        bull_regimes_last3 INTEGER NOT NULL DEFAULT 0,
+        bear_regimes_last3 INTEGER NOT NULL DEFAULT 0,
+        bull_regimes_last4 INTEGER NOT NULL DEFAULT 0,
+        bear_regimes_last4 INTEGER NOT NULL DEFAULT 0,
+        reversal_watch TEXT,
+        direction_invalidated BOOLEAN NOT NULL DEFAULT FALSE,
+        price_accept_long BOOLEAN NOT NULL DEFAULT FALSE,
+        price_accept_short BOOLEAN NOT NULL DEFAULT FALSE,
 
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -265,6 +274,15 @@ def ensure_early_detector_snapshots_table():
     ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS pcr_trend_points NUMERIC NOT NULL DEFAULT 0;
     ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS aggression_points NUMERIC NOT NULL DEFAULT 0;
     ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS imbalance_points NUMERIC NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS regime_state TEXT;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS bull_regimes_last3 INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS bear_regimes_last3 INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS bull_regimes_last4 INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS bear_regimes_last4 INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS reversal_watch TEXT;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS direction_invalidated BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS price_accept_long BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE public.early_detector_snapshots ADD COLUMN IF NOT EXISTS price_accept_short BOOLEAN NOT NULL DEFAULT FALSE;
     """
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -299,7 +317,10 @@ def persist_early_detector_snapshots(history_df):
         "futures_state", "futures_state_persistence", "futures_state_points",
         "total_flow_3m_cr", "money_flow_acceleration_3m_cr", "money_flow_acceleration_x",
         "money_flow_points", "pcr_trend_9m", "pcr_trend_points",
-        "aggression_points", "imbalance_points"
+        "aggression_points", "imbalance_points",
+        "regime_state", "bull_regimes_last3", "bear_regimes_last3",
+        "bull_regimes_last4", "bear_regimes_last4", "reversal_watch",
+        "direction_invalidated", "price_accept_long", "price_accept_short"
     ]
 
     def db_value(value):
@@ -1538,7 +1559,7 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
             return ("WATCH LONG" if direction == "BULL" else "WATCH SHORT"), "LOW", score, direction, absorption
         return "NEUTRAL", "LOW", score, direction, absorption
 
-    def score_at(sym, ts, og_all, ag_all, av_all, m):
+    def score_at(sym, ts, og_all, ag_all, av_all, m, prior_direction=None):
         og = og_all[og_all["ts"] <= ts].copy() if not og_all.empty else pd.DataFrame()
         ag = ag_all[ag_all["ts"] <= ts].copy() if not ag_all.empty else pd.DataFrame()
         av = av_all[av_all["ts"] <= ts].copy() if av_all is not None and not av_all.empty else pd.DataFrame()
@@ -1685,21 +1706,36 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
         bear += min(2.0, bear_oi_pts)
         oi_confirmation_points = max(bull_oi_pts, bear_oi_pts)
 
-        # ---------- 3) FUTURES STATE PERSISTENCE: max 2 points ----------
+        # ---------- 3) FOUR-REGIME FUTURES STRUCTURE: max 2 points ----------
+        # Fresh build receives the original persistence points.
+        # Covering/unwinding is an active directional regime for invalidation,
+        # but does not inflate the core /10 score.
         futures_state = "UNKNOWN"
         futures_state_persistence = 0
         futures_state_points = 0.0
+        regime_state = "UNKNOWN"
+        bull_regimes_last3 = bear_regimes_last3 = 0
+        bull_regimes_last4 = bear_regimes_last4 = 0
+        reversal_watch = None
+        direction_invalidated = False
+        price_accept_long = price_accept_short = False
+
         if pd.notna(px) and pd.notna(oi):
             if px > 0 and oi > 0:
                 futures_state = "LONG_BUILDUP"
+                regime_state = "FRESH LONG BUILD"
             elif px < 0 and oi > 0:
                 futures_state = "SHORT_BUILDUP"
+                regime_state = "FRESH SHORT BUILD"
             elif px > 0 and oi < 0:
                 futures_state = "SHORT_COVERING"
+                regime_state = "BULLISH SHORT COVERING"
             elif px < 0 and oi < 0:
                 futures_state = "LONG_UNWINDING"
+                regime_state = "BEARISH LONG UNWINDING"
             else:
                 futures_state = "MIXED"
+                regime_state = "MIXED"
 
         if not ag.empty:
             px_hist = pd.to_numeric(
@@ -1710,6 +1746,7 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
                 ag.get("engine_oi_change_3m_pct", ag.get("oi_change_3m_pct")),
                 errors="coerce"
             )
+
             long_flags = ((px_hist > 0) & (oi_hist > 0)).astype(int)
             short_flags = ((px_hist < 0) & (oi_hist > 0)).astype(int)
             long_state_p = tail_count(long_flags, lambda x: x == 1)
@@ -1723,6 +1760,54 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
                 futures_state_persistence = short_state_p
                 futures_state_points = 2.0 if short_state_p >= 3 else 1.0 if short_state_p >= 2 else 0.0
                 bear += futures_state_points
+
+            regimes = []
+            for p, o in zip(px_hist.tail(4), oi_hist.tail(4)):
+                if pd.isna(p) or pd.isna(o):
+                    regimes.append("MIXED")
+                elif p > 0 and o > 0:
+                    regimes.append("FRESH LONG BUILD")
+                elif p > 0 and o < 0:
+                    regimes.append("BULLISH SHORT COVERING")
+                elif p < 0 and o > 0:
+                    regimes.append("FRESH SHORT BUILD")
+                elif p < 0 and o < 0:
+                    regimes.append("BEARISH LONG UNWINDING")
+                else:
+                    regimes.append("MIXED")
+
+            bull_set = {"FRESH LONG BUILD", "BULLISH SHORT COVERING"}
+            bear_set = {"FRESH SHORT BUILD", "BEARISH LONG UNWINDING"}
+            bull_regimes_last3 = sum(r in bull_set for r in regimes[-3:])
+            bear_regimes_last3 = sum(r in bear_set for r in regimes[-3:])
+            bull_regimes_last4 = sum(r in bull_set for r in regimes[-4:])
+            bear_regimes_last4 = sum(r in bear_set for r in regimes[-4:])
+
+            # Price acceptance uses the stock's cumulative session move, not a
+            # single noisy 3-minute candle.
+            sess_hist = pd.to_numeric(ag["session_price_pct"], errors="coerce").dropna().tail(3)
+            if len(sess_hist) >= 3:
+                price_accept_long = bool(sess_hist.iloc[-1] > sess_hist.iloc[-2] > sess_hist.iloc[-3])
+                price_accept_short = bool(sess_hist.iloc[-1] < sess_hist.iloc[-2] < sess_hist.iloc[-3])
+
+            # Stage 1: 2/3 opposite regimes = warning + immediate evidence decay.
+            if prior_direction == "BEAR" and bull_regimes_last3 >= 2:
+                reversal_watch = "BULLISH REVERSAL WATCH"
+                bear *= 0.5
+            elif prior_direction == "BULL" and bear_regimes_last3 >= 2:
+                reversal_watch = "BEARISH REVERSAL WATCH"
+                bull *= 0.5
+
+            # Stage 2: 3/4 + price acceptance invalidates the old direction.
+            # This does NOT automatically confirm the opposite direction.
+            if prior_direction == "BEAR" and bull_regimes_last4 >= 3 and price_accept_long:
+                direction_invalidated = True
+                bear = min(bear, 1.5)
+                reversal_watch = "SHORT INVALIDATED — BULLISH REVERSAL DEVELOPING"
+            elif prior_direction == "BULL" and bear_regimes_last4 >= 3 and price_accept_short:
+                direction_invalidated = True
+                bull = min(bull, 1.5)
+                reversal_watch = "LONG INVALIDATED — BEARISH REVERSAL DEVELOPING"
 
         # ---------- 4) LIVE 3-MIN MONEY FLOW EXPANSION: max 1.5 ----------
         total_flow_3m_cr = None
@@ -1873,6 +1958,23 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
         state, conviction, score, direction, absorption = classify_state(
             bull, bear, imb, px, td, delta_eligible, m24, bo, so, session_px
         )
+
+        # Reversal architecture: old direction is invalidated before the new
+        # direction is promoted. Core stock thresholds remain unchanged.
+        if direction_invalidated:
+            if prior_direction == "BEAR" and direction == "BULL" and bull >= 4:
+                state = "BUILDING LONG — REVERSAL"
+                conviction = "MEDIUM" if bull < 6 else "HIGH"
+            elif prior_direction == "BULL" and direction == "BEAR" and bear >= 4:
+                state = "BUILDING SHORT — REVERSAL"
+                conviction = "MEDIUM" if bear < 6 else "HIGH"
+            else:
+                state = reversal_watch or "DIRECTION INVALIDATED"
+                conviction = "WARNING"
+        elif reversal_watch:
+            state = reversal_watch
+            conviction = "WARNING"
+
         return {
             "ts": ts, "bull": min(10, bull), "bear": min(10, bear),
             "state": state, "conviction": conviction, "score": score,
@@ -1924,7 +2026,16 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
             "pcr_trend_9m": pcr_trend_9m,
             "pcr_trend_points": pcr_trend_points,
             "aggression_points": aggression_points,
-            "imbalance_points": imbalance_points
+            "imbalance_points": imbalance_points,
+            "regime_state": regime_state,
+            "bull_regimes_last3": bull_regimes_last3,
+            "bear_regimes_last3": bear_regimes_last3,
+            "bull_regimes_last4": bull_regimes_last4,
+            "bear_regimes_last4": bear_regimes_last4,
+            "reversal_watch": reversal_watch,
+            "direction_invalidated": direction_invalidated,
+            "price_accept_long": price_accept_long,
+            "price_accept_short": price_accept_short
         }
 
     result = []
@@ -1968,7 +2079,15 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
             ts_values += list(pd.to_datetime(av["ts"], errors="coerce").dropna())
         ts_values = sorted(set(ts_values))
 
-        hist = [score_at(sym, ts, og, ag, av, m) for ts in ts_values]
+        hist = []
+        prior_direction = None
+        for ts in ts_values:
+            row_state = score_at(sym, ts, og, ag, av, m, prior_direction=prior_direction)
+            hist.append(row_state)
+            dnow = row_state.get("direction")
+            # Only carry a direction with meaningful core evidence.
+            if dnow in ("BULL", "BEAR") and float(row_state.get("score", 0) or 0) >= 2:
+                prior_direction = dnow
         hdf = pd.DataFrame(hist)
 
         # Retain every reconstructed state so it can be persisted independently
@@ -2014,7 +2133,10 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
                 "total_flow_3m_cr":None,"money_flow_acceleration_3m_cr":None,
                 "money_flow_acceleration_x":None,"money_flow_points":0.0,
                 "pcr_trend_9m":None,"pcr_trend_points":0.0,
-                "aggression_points":0.0,"imbalance_points":0.0
+                "aggression_points":0.0,"imbalance_points":0.0,
+                "regime_state":"UNKNOWN","bull_regimes_last3":0,"bear_regimes_last3":0,
+                "bull_regimes_last4":0,"bear_regimes_last4":0,"reversal_watch":None,
+                "direction_invalidated":False,"price_accept_long":False,"price_accept_short":False
             }
             peak_state, peak_conviction, peak_score, peak_time = "NEUTRAL","LOW",0.0,pd.NaT
             reversal, reversal_time = False, pd.NaT
@@ -2148,6 +2270,15 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatili
             "pcr_trend_points": current.get("pcr_trend_points",0),
             "aggression_points": current.get("aggression_points",0),
             "imbalance_points": current.get("imbalance_points",0),
+            "regime_state": current.get("regime_state","UNKNOWN"),
+            "bull_regimes_last3": current.get("bull_regimes_last3",0),
+            "bear_regimes_last3": current.get("bear_regimes_last3",0),
+            "bull_regimes_last4": current.get("bull_regimes_last4",0),
+            "bear_regimes_last4": current.get("bear_regimes_last4",0),
+            "reversal_watch": current.get("reversal_watch"),
+            "direction_invalidated": current.get("direction_invalidated",False),
+            "price_accept_long": current.get("price_accept_long",False),
+            "price_accept_short": current.get("price_accept_short",False),
 
             "minutes_2_to_4": pd.to_numeric(m.get("minutes_2_to_4"), errors="coerce") if m is not None else None,
             "time_2pct": m.get("time_2pct") if m is not None else pd.NaT,
@@ -2285,7 +2416,7 @@ def build_fast_reversal_events(history_df):
 # UI
 # ============================================================
 
-st.title(f"Top {MONEY_FLOW_TOP_N} Money Flow — Early Detector v2.9.1")
+st.title(f"Top {MONEY_FLOW_TOP_N} Money Flow — Early Detector v3.0 Four-Regime")
 st.caption("State + Conviction • Options → Executed Delta → Order Book → Price Response → Futures OI → Acceleration.")
 
 universe = load_universe()
@@ -2382,7 +2513,7 @@ with tab0:
             "Futures aggression is unavailable for the current universe date. "
             "Scores are option-only and should not be compared with fully confirmed scores."
         )
-    st.subheader("Early Detector v2.9.2 — Structure-First Current + Peak State")
+    st.subheader("Early Detector v3.0 — Four-Regime + Reversal Decay")
     st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
 
     if v2_board.empty:
@@ -2423,6 +2554,9 @@ with tab0:
             "avwap_high","hourly_avwap_high","avwap_low","hourly_avwap_low","avwap_source_ts",
             "session_price_pct","cumulative_oi_pct",
             "price_persistence_points","oi_confirmation_points",
+            "regime_state","bull_regimes_last3","bear_regimes_last3",
+            "bull_regimes_last4","bear_regimes_last4","reversal_watch",
+            "direction_invalidated","price_accept_long","price_accept_short",
             "futures_state","futures_state_persistence","futures_state_points",
             "total_flow_3m_cr","money_flow_acceleration_3m_cr","money_flow_acceleration_x","money_flow_points",
             "pcr_trend_9m","pcr_trend_points","aggression_points","imbalance_points",
@@ -2507,11 +2641,13 @@ with tab0:
             }
         )
 
-        st.markdown("#### v2.9.2 structure-first scoring logic")
+        st.markdown("#### v3.0 structure-first + reversal-decay logic")
         st.caption(
-            "Primary /10 score: Price persistence 2 + Futures OI confirmation 2 + "
-            "LONG/SHORT buildup persistence 2 + 3-minute money-flow expansion 1.5 + "
+            "Primary /10 weights are unchanged: Price persistence 2 + Futures OI confirmation 2 + "
+            "fresh LONG/SHORT buildup persistence 2 + 3-minute money-flow expansion 1.5 + "
             "PCR rolling trend 1 + executed aggression 1 + quantity imbalance 0.5. "
+            "v3.0 adds four-regime reversal watch, old-direction score decay and 3-of-4 + price-acceptance invalidation. "
+            "Short covering/long unwinding can invalidate stale direction but do not inflate the core /10 score. "
             "Options, same-strike OI, AVWAP, relative strength and volume remain confirmation diagnostics."
         )
         st.caption(
